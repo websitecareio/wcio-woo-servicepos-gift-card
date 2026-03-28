@@ -578,17 +578,6 @@ function call($method, $endpoint, $data = false)
     $current_balance = floatval(get_post_meta($postID, "_ywgc_balance_total", true));
     $new_balance = $amount - $amountspent;
 
-    // 🛡️ Beskyttelse 1: Ignorer hvis amountspent=0 og kortet allerede har været brugt
-    if ($amountspent == 0 && $current_balance < $amount) {
-        $notes = get_post_meta($postID, "_ywgc_internal_notes", true);
-        $notes .= "\r\n".date("d-m-Y h:i:s").": IGNORED webhook [Beskyttelse 1]"
-            . " | Årsag: amountspent=0 men kortet har været brugt"
-            . " | C1ST sendte: amount=$amount, amountspent=$amountspent"
-            . " | WC balance uændret: $current_balance kr."
-            . " | Ville have nulstillet kortet til: $new_balance kr.";
-        update_post_meta($postID, "_ywgc_internal_notes", $notes);
-        return new WP_REST_Response('Webhook ignored - would reset used gift card!', 200);
-    }
 
     // 🛡️ Beskyttelse 2: Ignorer hvis ny balance er højere end nuværende
     if ($new_balance > $current_balance) {
@@ -647,10 +636,10 @@ function call($method, $endpoint, $data = false)
         $table_prefix = $wpdb->prefix;
         $WooCommerceGiftCardTableName = "posts";
 
-        /*
-        Example data:
-        {"content":{"id":317501,"giftcardno":"953462762930","amount":1,"amountspent":0,"createddate":"2024-07-08 19:34:06","expirationdate":"2027-07-08 21:59:59","paymentid":16593923,"type":"giftcard","vat":25,"productid":7987676,"productno":"giftcard","expired":false,"deleted_at":null,"deleted":false,"store":{"id":3241},"customer":null},"event":"giftcard.created","logid":12723294,"resthookid":5598,"storeid":3241,"initiated":"2024-07-08T19:34:09+00:00","metadata":[]}
-        */
+      //
+       // Example data:
+       // {"content":{"id":317501,"giftcardno":"953462762930","amount":1,"amountspent":0,"createddate":"2024-07-08 19:34:06","expirationdate":"2027-07-08 21:59:59","paymentid":16593923,"type":"giftcard","vat":25,"productid":7987676,"productno":"giftcard","expired":false,"deleted_at":null,"deleted":false,"store":{"id":3241},"customer":null},"event":"giftcard.created","logid":12723294,"resthookid":5598,"storeid":3241,"initiated":"2024-07-08T19:34:09+00:00","metadata":[]}
+       //
      
         // Gem værdier i variabler
          $content = $payload_decode->content;
