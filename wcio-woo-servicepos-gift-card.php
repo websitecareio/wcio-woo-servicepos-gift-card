@@ -4,7 +4,7 @@
  * Plugin Name: Woo Gift Cards synchronize Customers 1st. 
  * Plugin URI: https://websitecare.dk/
  * Description: Synchronize WooCommerce gift cards with Customers 1st. 
- * Version: 1.4.5
+ * Version: 1.4.4
  * Author: Websitecare.dk
  * Author URI: https://websitecare.dk
  */
@@ -543,87 +543,6 @@ function call($method, $endpoint, $data = false)
  * @param WP_REST_Request $request The REST API request object.
  * @return WP_REST_Response Returns a REST API response object with status and message.
  */
-
-   function c1st_giftcard_updated_api_endpoint($request)
-{
-    $signature = $request->get_header('X-C1st-Webhook-Signature');
-    $secret = $this->restsecret;
-    $payload = $request->get_body();
-    $payload_decode = json_decode($payload);
-    $calculated_hmac = base64_encode(hash_hmac('sha256', $payload, $secret, true));
-
-    if ($signature != $calculated_hmac) {
-        header("HTTP/1.0 401 Webhook failed signature check");
-        die("401, Webhook failed signature check");
-        return;
-    }
-
-    global $wpdb;
-    $table_prefix = $wpdb->prefix;
-    $WooCommerceGiftCardTableName = "posts";
-
-    $content     = $payload_decode->content;
-    $giftcardno  = $content->giftcardno;
-    $amount      = floatval($content->amount);
-    $amountspent = floatval($content->amountspent);
-
-    $wooGiftCard = $wpdb->get_results("SELECT * FROM $table_prefix$WooCommerceGiftCardTableName WHERE post_type = 'gift_card' AND post_title = '$giftcardno' LIMIT 1");
-    $postID = $wooGiftCard["0"]->ID;
-
-    if (!$postID) {
-        return new WP_REST_Response('Gift Card not found in WooCommerce!', 412);
-    }
-
-    // Hent nuværende WC balance
-    $current_balance = floatval(get_post_meta($postID, "_ywgc_balance_total", true));
-    $new_balance = $amount - $amountspent;
-
-    // 🛡️ Beskyttelse 1: Ignorer hvis amountspent=0 og kortet allerede har været brugt
-    if ($amountspent == 0 && $current_balance < $amount) {
-        $notes = get_post_meta($postID, "_ywgc_internal_notes", true);
-        $notes .= "\r\n".date("d-m-Y h:i:s").": IGNORED webhook [Beskyttelse 1]"
-            . " | Årsag: amountspent=0 men kortet har været brugt"
-            . " | C1ST sendte: amount=$amount, amountspent=$amountspent"
-            . " | WC balance uændret: $current_balance kr."
-            . " | Ville have nulstillet kortet til: $new_balance kr.";
-        update_post_meta($postID, "_ywgc_internal_notes", $notes);
-        return new WP_REST_Response('Webhook ignored - would reset used gift card!', 200);
-    }
-
-    // 🛡️ Beskyttelse 2: Ignorer hvis ny balance er højere end nuværende
-    if ($new_balance > $current_balance) {
-        $notes = get_post_meta($postID, "_ywgc_internal_notes", true);
-        $notes .= "\r\n".date("d-m-Y h:i:s").": IGNORED webhook [Beskyttelse 2]"
-            . " | Årsag: ny balance ville være højere end nuværende"
-            . " | C1ST sendte: amount=$amount, amountspent=$amountspent"
-            . " | WC balance uændret: $current_balance kr."
-            . " | Ville have sat balance til: $new_balance kr.";
-        update_post_meta($postID, "_ywgc_internal_notes", $notes);
-        return new WP_REST_Response('Webhook ignored - balance would increase!', 200);
-    }
-
-    // 🛡️ Beskyttelse 3: Fjern wooGiftCardUpdate hook midlertidigt
-    // så webhook-opdateringen ikke trigger en PUT tilbage til C1ST
-    remove_action('updated_postmeta', array($this, 'wooGiftCardUpdate'), 10);
-
-    // Alt OK - opdater WC
-    update_post_meta($postID, "_ywgc_balance_total", $new_balance);
-
-    // Genaktiver hook'et igen
-    add_action('updated_postmeta', array($this, 'wooGiftCardUpdate'), 10, 4);
-
-    // Log
-    $notes = get_post_meta($postID, "_ywgc_internal_notes", true);
-    $notes .= "\r\n".date("d-m-Y h:i:s").": OPDATERET via C1ST webhook"
-        . " | C1ST sendte: amount=$amount, amountspent=$amountspent"
-        . " | WC balance før: $current_balance kr."
-        . " | WC balance efter: $new_balance kr.";
-    update_post_meta($postID, "_ywgc_internal_notes", $notes);
-
-    return new WP_REST_Response('Gift Card Updated!', 200);
-}
-
-    /*
     function c1st_giftcard_updated_api_endpoint($request)
     {
         // Logik for hvad der skal ske ved opdatering af giftcard
@@ -694,7 +613,7 @@ function call($method, $endpoint, $data = false)
 
         return new WP_REST_Response('Gift Card Updated!', 200);
     }
-*/
+
 /**
  * Register custom API endpoints for handling giftcard creation and update.
  *
