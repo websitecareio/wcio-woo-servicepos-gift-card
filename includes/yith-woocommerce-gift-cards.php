@@ -17,11 +17,12 @@ class wcioWGCSSPservice extends wcioWGCSSP
             $this->token = get_option("wc_wciowgcssp_token"); // Customers 1st. token
 
             // Run this code if the gift card plugin is Woo Gift Card
-            add_action('wcio_wgcssp_cron_sync_woo_service_pos', array($this, 'wcio_wgcssp_cron_sync_woo_service_pos'));
-            add_action('wcio_wgcssp_cron_sync_service_pos_woo', array($this, 'wcio_wgcssp_cron_sync_service_pos_woo'));
-            add_action('admin_init',  array($this, 'ywgc_code_pattern'));
+           add_action('admin_init',  array($this, 'ywgc_code_pattern'));
+		  
+	
       }
-
+	
+	
       function ywgc_code_pattern()
       {
 
@@ -103,15 +104,27 @@ class wcioWGCSSPservice extends wcioWGCSSP
                   update_option('wcio_wgcssp_last_action', time());
 
                   $code = $card->post_title; // YITH
-                  $balance = floatval(get_post_meta($card->ID, "_ywgc_amount_total", true));  // This is initial balance
-                  $remaining = floatval(get_post_meta($card->ID, "_ywgc_balance_total", true)); // This is remaining
+                  //$balance = floatval(get_post_meta($card->ID, "_ywgc_amount_total", true));  // This is initial balance
+                  //$remaining = floatval(get_post_meta($card->ID, "_ywgc_balance_total", true)); // This is remaining
 
-                  // If this gift card is empty, then delete it.
-                  /*
-                  !!!!!!!!!!!!!!!!!!!!!!!!!!!!
-                  Beware: CODE REMOVED DUE TO ERRORS: IF GIFTCARD IS REMOVED A NEW CARD WILL BE CREATED WITH VALUE; BECASUE C1ST STILL HAVE VALUE. GIVING USERS MULTIPLE USES OF GIFTCARD.
-                  !!!!!!!!!!!!!!!!!!!!!!!!!!!!
-                  */
+		   // Check if "_ywgc_amount_total" exists, if not continue to the next iteration.
+               $balance_meta = get_post_meta($card->ID, "_ywgc_amount_total", true);
+               if ( $balance_meta === false ) {
+                   continue; // Skip to the next card if meta doesn't exist.
+               }
+               $balance = floatval($balance_meta);
+           
+               // Check if "_ywgc_balance_total" exists, if not continue to the next iteration.
+               $remaining_meta = get_post_meta($card->ID, "_ywgc_balance_total", true);
+               if ( $remaining_meta === false ) {
+                   continue; // Skip to the next card if meta doesn't exist.
+               }
+               $remaining = floatval($remaining_meta);
+
+               
+                 $balance = floatval(get_post_meta($card->ID, "_ywgc_amount_total", true));  // This is initial balance
+                 $remaining = floatval(get_post_meta($card->ID, "_ywgc_balance_total", true)); // This is remaining
+
 
                   $searchGiftCardRaw = $this->search($servicePOSGiftcards, 'giftcardno', $this->codeToServicePos($code));
                   $searchGiftCardCount = count($searchGiftCardRaw);
@@ -201,162 +214,7 @@ class wcioWGCSSPservice extends wcioWGCSSP
             $this->logging("Stopped <strong>wcio_wgcssp_cron_sync_woo_service_pos</strong> function.", "");
       }
 
-      // Tjekker Customers 1st. gift cards og opretter dem i WooCommerce Gift Cards hvis de ikke allerede findes. Hvis de findes i WooCommerce Gift Cards gør den ikke mere
-      // THis function does ONLY check Customers 1st., not WooCommerce.
-      function wcio_wgcssp_cron_sync_service_pos_woo()
-      {
-
-            // Start run
-            $this->logging("Started <strong>wcio_wgcssp_cron_sync_service_pos_woo</strong> function.", "");
-            // If its less than 5 minutes ago since last action, then dont? allow this ro run again.
-            $wcio_wgcssp_last_action_2 = get_option('wcio_wgcssp_last_action_2');
-            if ($wcio_wgcssp_last_action_2 > (time() - 300)) {
-                  $this->logging("Stopped run because it is less than 5 minutes ago since last run.", "");
-                 return;
-            }
-
-
-            // THis function should check service POS and do the sme as the Woo function did.
-            global $wpdb;
-            $table_prefix = $wpdb->prefix;
-            $WooCommerceGiftCardTableName = "posts";
-
-            // Sets the amount of gift cards per page.
-            $paginationPageLength = 249; // 250 is new Customers 1st. limit in future releases
-
-            // Make the full list of giftcards from Customers 1st.
-            $servicePOSGiftcards = array();
-            $x = 0;
-            while (true) {
-
-                  // Now we do the query with the paging.
-                  $paginationStart = $paginationPageLength * $x;
-
-                  $query = array("paginationPageLength" => $paginationPageLength, "paginationStart" => $paginationStart, "scope" => "sharegiftcards"); // Start from page 1 (0)
-                  $giftcards = $this->call("GET", "/giftcards", $query);
-
-                  // Log the data. We cannot use $giftcards in the log data. For some reason it cannot save it.. DB character limit possible. Using MEDIUMTEXT or LONGTEXT might fix it.
-                  $this->logging("Called GET /giftcards with parameters <strong>\"paginationPageLength\" => $paginationPageLength, \"paginationStart\" => $paginationStart</strong><br><strong>Count:</strong> " . count($giftcards["content"]) . "", "");
-
-                                                      // Check for errors
-                if($giftcards == null || $giftcards == "error") {
-              
-                        // Log the data. We cannot use $giftcards in the log data. For some reason it cannot save it.. DB character limit possible. Using MEDIUMTEXT or LONGTEXT might fix it.
-                        $this->logging("No response from API or error with authentication.", "");
-                        break;    
-
-                  }
-
-                  
-                  // Loops all Customers 1st. giftcard
-                  foreach ($giftcards["content"] as $card) {
-
-
-                        // Update last action
-                        update_option('wcio_wgcssp_last_action_2', time());
-
-                        $id = $card["id"]; //47021
-                        $giftcardno = $card["giftcardno"]; //724503989151
-                        $code = $giftcardno; //724503989151
-                        $amount = floatval($card["amount"]); //49
-                        $amountspent = floatval($card["amountspent"]); //0
-
-                        $amountremaining = $amount - $amountspent; //0
-     
-                        // Make woo data format of giftcard and search for the giftcard
-                        $codeToWoo = $this->codeToWoo($code);
-                        $wooGiftCards = $wpdb->get_results("SELECT * FROM $table_prefix$WooCommerceGiftCardTableName WHERE post_type = 'gift_card' AND post_title = '$codeToWoo' LIMIT 1");
-
-                        // If gift card was found in WooCommerce and we verified it was the same card
-                        $wooGiftCardNumber = $wooGiftCards["0"]->post_title;
-
-                        if (count($wooGiftCards) == "1" && $wooGiftCardNumber == $codeToWoo && $code != "") {
-
-                              $balance = floatval(get_post_meta($wooGiftCards["0"]->ID, "_ywgc_amount_total", true)) ?? 0;  // This is initial balance
-                              $remaining = floatval(get_post_meta($wooGiftCards["0"]->ID, "_ywgc_balance_total", true)) ?? 0; // This is remaining
-
-                              $spent = $balance - $remaining; // This is spent
-
-                              // Match values to make sure this isnt an outdated card.
-                              $wooRemaning = $remaining;
-
-                              if ($wooRemaning != $amountremaining) {
-
-                                    // The amounts wasnt the same, and they should be. Find the card with most spent and update the other.
-                                    // If the card in WooCommerce have been used more then the one in Customers 1st., then update Customers 1st.
-                                    if ($wooRemaning < $amountremaining) {
-
-                                          // If WooCommerce gift card have more spent on it, then we need to update Customers 1st.
-                                          $newAmount = $amount - $wooRemaning;
-                                          $giftcard = [
-                                                'amountspent' => (float)$newAmount
-                                          ];
-
-                                          // Update giftcard in Customers 1st.
-                                          $this->call("PUT", "/giftcards/" . $id, ['content' => $giftcard]);
-                                          $this->logging("Called PUT /giftcards/$id with content <strong>" . json_encode($giftcard) . "</strong><br>
-                                          Giftcard: $id will be updated in Customers 1st. with this new value: <strong>$newAmount</strong>.<br>
-                                          Because wooRemaning ($wooRemaning) is LOWER than amountremaining ($amountremaining).<br>
-                                          Old value in Customers 1st.: <strong>$amountremaining ($amount-$amountspent)</strong>", $wooGiftCardNumber);
-                                          continue;
-                                    } else {
-
-                                          // Customers 1st. have most spent, then update WooCommerce
-                                          // CodeToWoo Not needed, this stems from Woo.
-                                          $remaining = $amountremaining;
-                                          update_post_meta($wooGiftCards["0"]->ID, "_ywgc_balance_total", $remaining); // This is remaining
-                                          $this->logging("Giftcard: " . $wooGiftCards["0"]->ID . " will be updated in WooCommerce with this new value: <strong>$remaining</strong>.<br>
-                                          Because wooRemaning ($wooRemaning) is HIGHER than amountremaining ($amountremaining).<br>
-                                          Old value in WooCommerce: <strong>$spent = ($balance-$remaining)</strong>", $wooGiftCardNumber);
-                                          continue;
-                                    }
-                              }
-                            
-                              // Giftcard wasnt found in WooCommerce      
-                        } else if (count($wooGiftCards) == "0") {
-                           
-                              // Skip if its zero, we dont want empty cards in the system.
-                              if ($amountremaining == 0) {
-                                    continue;
-                              }
-                         
-                              // It wasnt found at WooCommerce.
-                              // The card wasnt found in WooCommerce, we need to create it.
-                              $time = time();
-
-                              $newWooGiftCardRemaning = $amountremaining;
-
-                       
-                              // Create post object
-                              $my_post = array(
-                                    'post_title'    => wp_strip_all_tags($codeToWoo),
-                                    'post_content'  => "",
-                                    'post_status'   => 'publish',
-                                    'post_author'   => 1,
-                                    'post_type'     => "gift_card"
-                              );
-                            
-                              // Insert the post into the database
-                              $postID = wp_insert_post($my_post);
-
-                              update_post_meta($postID, "_ywgc_amount_total", $amount);  // The gift card amount
-                              update_post_meta($postID, "_ywgc_balance_total", $newWooGiftCardRemaning); // The current amount available for the customer
-                            
-                              $this->logging("Giftcard: " . wp_strip_all_tags($codeToWoo) . " will be created in WooCommerce with this remaining value (Original card value: $amount): <strong>$newWooGiftCardRemaning</strong>.<br>", wp_strip_all_tags($codeToWoo));
-                              continue;
-                        }
-                  }
-
-                  // If hasMore is false, break
-                  if ($giftcards["hasMore"] == false || $giftcards == null) {
-                        break;
-                  }
-                  $x++;
-            }
-
-
-            $this->logging("Stopped <strong>wcio_wgcssp_cron_sync_service_pos_woo</strong> function.", "");
-      }
+   
 
       // Skal bruges for alle kort der stammer fra Woo og som skal til Customers 1st.
       // This can only be removed in 22-03-2026 due to giftcard expire dates. 
