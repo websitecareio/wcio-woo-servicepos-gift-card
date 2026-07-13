@@ -4,7 +4,7 @@
  * Plugin Name: Woo Gift Cards synchronize Customers 1st. 
  * Plugin URI: https://websitecare.dk/
  * Description: Synchronize WooCommerce gift cards with Customers 1st. 
- * Version: 1.5.0
+ * Version: 1.5.1
  * Author: Websitecare.dk
  * Author URI: https://websitecare.dk
  */
@@ -436,18 +436,56 @@ function call($method, $endpoint, $data = false)
             return false; // Ingen udløbsdato sat
         }
 
-        // Hvis det allerede er et Unix timestamp (tal)
-        if (is_numeric($expiration)) {
-            return date("Y-m-d H:i:s", (int) $expiration);
+        // Håndter MySQL "zero-date" artefakter (fx "0000-00-00 00:00:00"),
+        // som nogle systemer bruger som sentinel-værdi for "ingen dato".
+        if (is_string($expiration) && preg_match('/^0{4}-0{2}-0{2}/', trim($expiration))) {
+            return false;
         }
 
-        // Ellers forsøg at parse det som en dato-streng
-        $timestamp = strtotime($expiration);
-        if ($timestamp === false) {
+        // Find timestamp - enten direkte (allerede et Unix timestamp) eller via parsing af dato-streng
+        if (is_numeric($expiration)) {
+            $timestamp = (int) $expiration;
+        } else {
+            $timestamp = strtotime($expiration);
+        }
+
+        // Ugyldig eller urealistisk værdi (fx parsing-fejl eller dato omkring/før 1970)
+        if ($timestamp === false || $timestamp <= 0) {
             return false;
         }
 
         return date("Y-m-d H:i:s", $timestamp);
+    }
+
+    /**
+     * Parser en dato-streng fra C1ST (fx "2027-07-08 21:59:59") til et sikkert
+     * Unix timestamp, klar til at blive gemt i YITH's "_ywgc_expiration" meta-felt.
+     *
+     * Beskytter mod ugyldige værdier og MySQL "zero-date" artefakter
+     * (fx "0000-00-00 00:00:00"), som ellers ville blive tolket som en
+     * urealistisk dato langt tilbage i tiden - hvilket ville få YITH til
+     * fejlagtigt at markere et gyldigt gavekort som udløbet.
+     *
+     * @param string $dateString
+     * @return int|false Unix timestamp, eller false hvis ugyldig/ingen dato.
+     */
+    private function parseC1STExpirationDate($dateString) {
+
+        if (empty($dateString) || !is_string($dateString)) {
+            return false;
+        }
+
+        if (preg_match('/^0{4}-0{2}-0{2}/', trim($dateString))) {
+            return false;
+        }
+
+        $timestamp = strtotime($dateString);
+
+        if ($timestamp === false || $timestamp <= 0) {
+            return false;
+        }
+
+        return $timestamp;
     }
 
     //Run when giftcards are made from WooCommerce
@@ -621,12 +659,10 @@ function call($method, $endpoint, $data = false)
         update_post_meta($postID, "_ywgc_internal_notes", "".date("d-m-Y h:i:s").": Created using Websitcare.dk´s giftcard plugin."); // Just internal notes
 
         // Gem udløbsdato fra C1ST i det format YITH forventer (Unix timestamp)
-        if (!empty($expirationdate)) {
-            $expirationTimestamp = strtotime($expirationdate);
-            if ($expirationTimestamp !== false) {
-                update_post_meta($postID, "_ywgc_expiration", $expirationTimestamp);
-                update_post_meta($postID, "_ywgc_expiration_date_formatted", date_i18n(apply_filters('yith_wcgc_date_format', 'Y-m-d'), $expirationTimestamp));
-            }
+        $expirationTimestamp = $this->parseC1STExpirationDate($expirationdate);
+        if ($expirationTimestamp !== false) {
+            update_post_meta($postID, "_ywgc_expiration", $expirationTimestamp);
+            update_post_meta($postID, "_ywgc_expiration_date_formatted", date_i18n(apply_filters('yith_wcgc_date_format', 'Y-m-d'), $expirationTimestamp));
         }
 
         return new WP_REST_Response('Gift Card Created!', 200);
@@ -711,12 +747,10 @@ function call($method, $endpoint, $data = false)
         update_post_meta($postID, "_ywgc_internal_notes", $updated_notes); // Just internal notes   
 
         // Hold udløbsdato synkroniseret, hvis den er ændret i C1ST
-        if (!empty($expirationdate)) {
-            $expirationTimestamp = strtotime($expirationdate);
-            if ($expirationTimestamp !== false) {
-                update_post_meta($postID, "_ywgc_expiration", $expirationTimestamp);
-                update_post_meta($postID, "_ywgc_expiration_date_formatted", date_i18n(apply_filters('yith_wcgc_date_format', 'Y-m-d'), $expirationTimestamp));
-            }
+        $expirationTimestamp = $this->parseC1STExpirationDate($expirationdate);
+        if ($expirationTimestamp !== false) {
+            update_post_meta($postID, "_ywgc_expiration", $expirationTimestamp);
+            update_post_meta($postID, "_ywgc_expiration_date_formatted", date_i18n(apply_filters('yith_wcgc_date_format', 'Y-m-d'), $expirationTimestamp));
         }
                             
 
