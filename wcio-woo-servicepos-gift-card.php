@@ -4,7 +4,7 @@
  * Plugin Name: Woo Gift Cards synchronize Customers 1st. 
  * Plugin URI: https://websitecare.dk/
  * Description: Synchronize WooCommerce gift cards with Customers 1st. 
- * Version: 1.4.5
+ * Version: 1.5.0
  * Author: Websitecare.dk
  * Author URI: https://websitecare.dk
  */
@@ -237,6 +237,8 @@ function call($method, $endpoint, $data = false)
         $amount_total = get_post_meta($post_id, '_ywgc_amount_total', true);
         $balance_total = get_post_meta($post_id, '_ywgc_balance_total', true);
         $giftcardNo = $post->post_title;
+        // Udløbsdato gemt af YITH som Unix timestamp (0 = ingen udløbsdato)
+        $expiration = get_post_meta($post_id, '_ywgc_expiration', true);
 
 
         // Tjek om posttypen er 'gift_card'
@@ -294,7 +296,7 @@ function call($method, $endpoint, $data = false)
                 } else {
 
                     // If none found, then we need to create this giftcard instead.
-                    $this->createGiftCardC1ST($giftcardNo, $amount_total, $balance_total);
+                    $this->createGiftCardC1ST($giftcardNo, $amount_total, $balance_total, $expiration);
 
                 }
 
@@ -302,7 +304,7 @@ function call($method, $endpoint, $data = false)
                 
                 // New gift card
                 // Send new giftcard to C1ST
-                $this->createGiftCardC1ST($giftcardNo, $amount_total, $balance_total);
+                $this->createGiftCardC1ST($giftcardNo, $amount_total, $balance_total, $expiration);
 
             }
 
@@ -384,7 +386,16 @@ function call($method, $endpoint, $data = false)
 
     }
 
-    public function createGiftCardC1ST($giftcardNo, $amount_total, $balance_total) {
+    /**
+     * Opretter et gavekort i C1ST.
+     *
+     * @param string $giftcardNo Gavekortnummer
+     * @param float $amount_total Totalbeløb
+     * @param float $balance_total Nuværende saldo
+     * @param int|string $expiration Udløbsdato. Kan være et Unix timestamp (som YITH bruger) eller en dato-streng.
+     *                               0, tom streng eller null betyder ingen udløbsdato.
+     */
+    public function createGiftCardC1ST($giftcardNo, $amount_total, $balance_total, $expiration = 0) {
 
         // Calculated amountspent.
         $amountspent = $amount_total-$balance_total;
@@ -401,8 +412,42 @@ function call($method, $endpoint, $data = false)
             )
       ];
 
+        // Tilføj udløbsdato, hvis der er sat en (YITH gemmer 0 = ingen udløbsdato)
+        $expirationDateString = $this->formatExpirationForC1ST($expiration);
+        if ($expirationDateString) {
+            $giftcard["expirationdate"] = $expirationDateString;
+        }
+
        $this->call("POST", "/giftcards",  ['content' => $giftcard]);
 
+    }
+
+    /**
+     * Konverterer en udløbsdato til det format C1ST forventer ("Y-m-d H:i:s").
+     * Accepterer enten et Unix timestamp (int, som YITH bruger internt) eller
+     * en allerede formateret dato-streng.
+     *
+     * @param int|string $expiration
+     * @return string|false Formateret dato-streng, eller false hvis ingen udløbsdato.
+     */
+    private function formatExpirationForC1ST($expiration) {
+
+        if (empty($expiration) || $expiration === '0') {
+            return false; // Ingen udløbsdato sat
+        }
+
+        // Hvis det allerede er et Unix timestamp (tal)
+        if (is_numeric($expiration)) {
+            return date("Y-m-d H:i:s", (int) $expiration);
+        }
+
+        // Ellers forsøg at parse det som en dato-streng
+        $timestamp = strtotime($expiration);
+        if ($timestamp === false) {
+            return false;
+        }
+
+        return date("Y-m-d H:i:s", $timestamp);
     }
 
     //Run when giftcards are made from WooCommerce
@@ -425,8 +470,10 @@ function call($method, $endpoint, $data = false)
             $total_balance = $property->getValue($gift_card);
         }
 
+        // Udløbsdato (Unix timestamp fra YITH, 0 = ingen udløbsdato)
+        $expiration = isset($gift_card->expiration) ? $gift_card->expiration : 0;
 
-        $this->createGiftCardC1ST($gift_card->gift_card_number, $gift_card->total_amount, $total_balance);
+        $this->createGiftCardC1ST($gift_card->gift_card_number, $gift_card->total_amount, $total_balance, $expiration);
     }
 
 /**
@@ -573,6 +620,15 @@ function call($method, $endpoint, $data = false)
         update_post_meta($postID, "_ywgc_balance_total", $amount); // The current amount available for the customer
         update_post_meta($postID, "_ywgc_internal_notes", "".date("d-m-Y h:i:s").": Created using Websitcare.dk´s giftcard plugin."); // Just internal notes
 
+        // Gem udløbsdato fra C1ST i det format YITH forventer (Unix timestamp)
+        if (!empty($expirationdate)) {
+            $expirationTimestamp = strtotime($expirationdate);
+            if ($expirationTimestamp !== false) {
+                update_post_meta($postID, "_ywgc_expiration", $expirationTimestamp);
+                update_post_meta($postID, "_ywgc_expiration_date_formatted", date_i18n(apply_filters('yith_wcgc_date_format', 'Y-m-d'), $expirationTimestamp));
+            }
+        }
+
         return new WP_REST_Response('Gift Card Created!', 200);
 
     }
@@ -653,6 +709,15 @@ function call($method, $endpoint, $data = false)
         $current_notes = get_post_meta($postID, "_ywgc_internal_notes", true);
         $updated_notes = $current_notes . "\r\n".date("d-m-Y h:i:s").": _ywgc_balance_total update from C1ST REST hook giftcard.updated : amount - amountspent ($amount-$amountspent)";
         update_post_meta($postID, "_ywgc_internal_notes", $updated_notes); // Just internal notes   
+
+        // Hold udløbsdato synkroniseret, hvis den er ændret i C1ST
+        if (!empty($expirationdate)) {
+            $expirationTimestamp = strtotime($expirationdate);
+            if ($expirationTimestamp !== false) {
+                update_post_meta($postID, "_ywgc_expiration", $expirationTimestamp);
+                update_post_meta($postID, "_ywgc_expiration_date_formatted", date_i18n(apply_filters('yith_wcgc_date_format', 'Y-m-d'), $expirationTimestamp));
+            }
+        }
                             
 
         return new WP_REST_Response('Gift Card Updated!', 200);
