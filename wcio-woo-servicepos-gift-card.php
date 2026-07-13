@@ -4,7 +4,7 @@
  * Plugin Name: Woo Gift Cards synchronize Customers 1st. 
  * Plugin URI: https://websitecare.dk/
  * Description: Synchronize WooCommerce gift cards with Customers 1st. 
- * Version: 1.4.4
+ * Version: 1.4.5
  * Author: Websitecare.dk
  * Author URI: https://websitecare.dk
  */
@@ -286,7 +286,9 @@ function call($method, $endpoint, $data = false)
 
                     // Update giftcard in C1ST
                     $giftcardId = $searchQuerydata["content"][0]["id"];
-                    $this->updateGiftCardC1ST($giftcardId, $amount_total, $balance_total);
+                    // Nuværende amountspent i C1ST, bruges til at sikre at saldoen aldrig kan gå OP
+                    $currentAmountSpent = isset($searchQuerydata["content"][0]["amountspent"]) ? $searchQuerydata["content"][0]["amountspent"] : null;
+                    $this->updateGiftCardC1ST($giftcardId, $amount_total, $balance_total, $currentAmountSpent);
                     
 
                 } else {
@@ -309,28 +311,67 @@ function call($method, $endpoint, $data = false)
     }
 
 
-    public function findGiftCardIdC1ST($giftcardNo) {
+    /**
+     * Find hele gavekort-recorden i C1ST via gavekortnummer.
+     * Bruges bl.a. til at hente den nuværende amountspent-værdi,
+     * så vi kan sikre at saldoen aldrig sendes OP fra WooCommerce.
+     *
+     * @param string $giftcardNo
+     * @return array|false Gavekort-record fra C1ST, eller false hvis ikke fundet.
+     */
+    public function findGiftCardC1ST($giftcardNo) {
 
         $searchQuery = array("giftcardno" => $giftcardNo, "scope" => "sharegiftcards"); // Start from page 1 (0)
         $searchQuerydata = $this->call("GET", "/giftcards", $searchQuery);
 
          //Count if there is one
-         if(count($searchQuerydata["content"]) == 1) {
+         if(!empty($searchQuerydata["content"]) && count($searchQuerydata["content"]) == 1) {
 
-            // Update giftcard in C1ST
-            $giftcardId = $searchQuerydata["content"][0]["id"];
-            return $giftcardId;
+            return $searchQuerydata["content"][0];
 
          }
+
+         return false;
+
+    }
+
+    public function findGiftCardIdC1ST($giftcardNo) {
+
+        $giftcard = $this->findGiftCardC1ST($giftcardNo);
+
+        if ($giftcard && isset($giftcard["id"])) {
+            return $giftcard["id"];
+        }
 
          return false; 
 
     }
 
-    public function updateGiftCardC1ST($giftcardId, $amount_total, $balance_total) {
-        
+    /**
+     * Opdaterer et gavekorts amountspent i C1ST.
+     *
+     * VIGTIGT: WooCommerce må ALDRIG kunne hæve gavekortets saldo i C1ST.
+     * Derfor tjekkes den nuværende amountspent-værdi (hvis den er kendt)
+     * før opdateringen sendes. Hvis den nye amountspent er LAVERE end den
+     * nuværende (dvs. saldoen ville stige), blokeres opdateringen.
+     * Saldoen kan altså kun forblive uændret eller falde - aldrig stige.
+     *
+     * @param int $giftcardId C1ST gavekort-ID
+     * @param float $amount_total Gavekortets oprindelige totalbeløb (fra WooCommerce)
+     * @param float $balance_total Gavekortets nuværende saldo (fra WooCommerce)
+     * @param float|null $currentAmountSpent Den nuværende amountspent-værdi i C1ST, hvis kendt
+     * @return bool true hvis opdateringen blev sendt, false hvis den blev blokeret
+     */
+    public function updateGiftCardC1ST($giftcardId, $amount_total, $balance_total, $currentAmountSpent = null) {
+
         // Calculated amountspent.
         $amountspent = $amount_total-$balance_total;
+
+        // Sikkerhedstjek: bloker opdateringer der ville hæve saldoen (dvs. sænke amountspent)
+        if ($currentAmountSpent !== null && $amountspent < (float) $currentAmountSpent) {
+            error_log("wcioWGCSSP: Blokerede forsøg på at hæve gavekort-saldo i C1ST (giftcard ID $giftcardId). Nyt amountspent ($amountspent) er lavere end nuværende amountspent i C1ST ($currentAmountSpent). Opdatering IKKE sendt.");
+            return false;
+        }
 
         // Prepare array
          $giftcardData = [
@@ -338,6 +379,8 @@ function call($method, $endpoint, $data = false)
         ];
         
         $this->call("PUT", "/giftcards/$giftcardId", ['content' => $giftcardData]);
+
+        return true;
 
     }
 
@@ -412,10 +455,11 @@ function call($method, $endpoint, $data = false)
             $amount_total = get_post_meta($post_id, '_ywgc_amount_total', true);
             $balance_total = $meta_value;
 
-            $giftcardId = $this->findGiftCardIdC1ST($giftcardNo);
-            if($giftcardId) {
+            $giftcard = $this->findGiftCardC1ST($giftcardNo);
+            if($giftcard && isset($giftcard["id"])) {
 
-                $this->updateGiftCardC1ST($giftcardId, $amount_total, $balance_total);
+                $currentAmountSpent = isset($giftcard["amountspent"]) ? $giftcard["amountspent"] : null;
+                $this->updateGiftCardC1ST($giftcard["id"], $amount_total, $balance_total, $currentAmountSpent);
 
             } else {
 
