@@ -67,13 +67,13 @@ class WC_wciowgcssp {
             ),
             'wc_wciowgcssp_token' => array(
                 'name' => __( 'C1ST Token', 'woocommerce-settings-tab-demo' ),
-                'type' => 'text',
+                'type' => 'password',
                 'desc' => __( '', 'woocommerce-settings-tab-demo' ),
                 'id'   => 'wc_wciowgcssp_token'
             ),
             'wc_wciowgcssp_restsecret' => array(
                 'name' => __( 'Resthook secret', 'woocommerce-settings-tab-demo' ),
-                'type' => 'text',
+                'type' => 'password',
                 'desc' => __( '', 'woocommerce-settings-tab-demo' ),
                 'id'   => 'wc_wciowgcssp_restsecret'
             ),

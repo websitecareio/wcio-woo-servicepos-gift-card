@@ -4,7 +4,7 @@
  * Plugin Name: Woo Gift Cards synchronize Customers 1st. 
  * Plugin URI: https://websitecare.dk/
  * Description: Synchronize WooCommerce gift cards with Customers 1st. 
- * Version: 1.5.1
+ * Version: 1.5.4
  * Author: Websitecare.dk
  * Author URI: https://websitecare.dk
  */
@@ -17,75 +17,66 @@ if (!defined('ABSPATH')) {
 
 include("wooCommerceSettings.php");
 
-/** * Override YITH Gift Card deduction on draft orders * */ 
-if ( ! function_exists( 'override_yith_giftcard_deduction' ) ) {
-    add_action('woocommerce_new_order_item', 'override_yith_giftcard_deduction', 999, 3); 
-    function override_yith_giftcard_deduction($item_id, $item, $order_id) { 
-        if ($item instanceof WC_Order_Item_Coupon) { 
-            // get the order 
-            $order = wc_get_order($order_id); 
-            // if the order is draft, add the amount back to the gift card 
-            if ($order->get_status() == 'checkout-draft') { 
-                $code = $item->get_code(); 
-                $gift = YITH_YWGC()->get_gift_card_by_code($code); 
-                if ($gift instanceof YITH_YWGC_Gift_Card) { 
-                    $discount_amount = $item->get_discount(); 
-                    $gift->update_balance($gift->get_balance() + $discount_amount); 
-                } 
-            } 
+/**
+ * YITH can reserve/deduct a gift card while Nexi creates a checkout-draft.
+ * Restore that reservation once per coupon item and deduct it again only when
+ * the draft actually becomes a paid order.
+ */
+if ( ! function_exists( 'wcio_restore_yith_giftcard_on_checkout_draft' ) ) {
+    add_action( 'woocommerce_new_order_item', 'wcio_restore_yith_giftcard_on_checkout_draft', 999, 3 );
+
+    function wcio_restore_yith_giftcard_on_checkout_draft( $item_id, $item, $order_id ) {
+        if ( ! $item instanceof WC_Order_Item_Coupon || ! function_exists( 'YITH_YWGC' ) ) {
+            return;
         }
-    } 
+
+        $order = wc_get_order( $order_id );
+        if ( ! $order || 'checkout-draft' !== $order->get_status() ) {
+            return;
+        }
+
+        if ( wc_get_order_item_meta( $item_id, '_wcio_ywgc_draft_restored', true ) ) {
+            return;
+        }
+
+        $gift = YITH_YWGC()->get_gift_card_by_code( $item->get_code() );
+        if ( $gift instanceof YITH_YWGC_Gift_Card ) {
+            $gift->update_balance( (float) $gift->get_balance() + (float) $item->get_discount() );
+            wc_add_order_item_meta( $item_id, '_wcio_ywgc_draft_restored', 1, true );
+        }
+    }
 }
 
-/** * Deduct after the order is placed */
-if (!function_exists('override_yith_giftcard_deduction')) {
+if ( ! function_exists( 'wcio_deduct_yith_giftcard_after_draft_payment' ) ) {
+    add_action( 'woocommerce_order_status_changed', 'wcio_deduct_yith_giftcard_after_draft_payment', 10, 4 );
 
-    add_action('woocommerce_order_payment_status_changed', 'deduct_gift_card_balance', 10, 3);
-
-    function deduct_gift_card_balance($order_id, $new_status, $old_status)
-
-    {
-
-        if ( 'checkout-draft' == $old_status && ( 'processing' == $new_status || 'completed' == $new_status ) )
-
-        // Get the order
-
-        $order = wc_get_order($order_id);
-
-        // If the order contains coupons, deduct the amount from the gift card
-
-        if ($order->get_coupon_codes()) {
-
-            foreach ($order->get_coupon_codes() as $code) {
-
-                $gift = YITH_YWGC()->get_gift_card_by_code($code);
-
-                if ($gift instanceof YITH_YWGC_Gift_Card) {
-
-                    // Calculate the discount amount for this coupon
-
-                    $discount_amount = 0;
-
-                    foreach ($order->get_items('coupon') as $coupon_item) {
-
-                        if ($coupon_item->get_code() === $code) {
-
-                            $discount_amount += $coupon_item->get_discount();
-
-                        }
-
-                    }
-
-                    $gift->update_balance($gift->get_balance() - $discount_amount);
-
-                }
-
-            }
-
+    function wcio_deduct_yith_giftcard_after_draft_payment( $order_id, $old_status, $new_status, $order ) {
+        if (
+            'checkout-draft' !== $old_status
+            || ! in_array( $new_status, array( 'processing', 'completed' ), true )
+            || ! function_exists( 'YITH_YWGC' )
+        ) {
+            return;
         }
 
-    }
+        $order = $order instanceof WC_Order ? $order : wc_get_order( $order_id );
+        if ( ! $order ) {
+            return;
+        }
 
+        foreach ( $order->get_items( 'coupon' ) as $item_id => $coupon_item ) {
+            if ( ! wc_get_order_item_meta( $item_id, '_wcio_ywgc_draft_restored', true ) ) {
+                continue;
+            }
+
+            $gift = YITH_YWGC()->get_gift_card_by_code( $coupon_item->get_code() );
+            if ( $gift instanceof YITH_YWGC_Gift_Card ) {
+                $new_balance = max( 0, (float) $gift->get_balance() - (float) $coupon_item->get_discount() );
+                $gift->update_balance( $new_balance );
+                wc_delete_order_item_meta( $item_id, '_wcio_ywgc_draft_restored' );
+            }
+        }
+    }
 }
 
 
@@ -95,6 +86,9 @@ class wcioWGCSSP
 
     public $token;
     public $giftcardplugin;
+    private $restsecret;
+    private $processing_inbound_webhook = false;
+    private $allowed_balance_restores = array();
 
     public function __construct()
     {
@@ -132,6 +126,9 @@ class wcioWGCSSP
         // Specific for WooCommerce orders. When an order is saved a code will run and end with this hook. yith_ywgc_after_gift_card_generation_save with the data: $gift_card
         add_action('yith_ywgc_after_gift_card_generation_save', array($this, 'yith_ywgc_after_gift_card_generation_save'), 10, 1);
 
+        add_action('woocommerce_order_status_changed', array($this, 'prepareGiftCardBalanceRestore'), 1, 4);
+        add_action('woocommerce_order_status_changed', array($this, 'clearGiftCardBalanceRestore'), 100, 4);
+
 
         
     
@@ -154,56 +151,54 @@ class wcioWGCSSP
  */
 function call($method, $endpoint, $data = false)
 {
-
-    $url = 'https://app.deltateq.com/api' . $endpoint;
-    $curl = curl_init();
-    switch ($method) {
-        case "POST":
-            curl_setopt($curl, CURLOPT_POST, 1);
-            if ($data) {
-                curl_setopt($curl, CURLOPT_POSTFIELDS, json_encode($data));
-            }
-            break;
-        case "PUT":
-            curl_setopt($curl, CURLOPT_CUSTOMREQUEST, 'PUT');
-            if ($data) {
-                curl_setopt($curl, CURLOPT_POSTFIELDS, json_encode($data));
-            }
-            break;
-        default:
-            if ($data) {
-                $url = sprintf("%s?%s", $url, http_build_query($data));
-            }
+    if ( empty( $this->token ) ) {
+        error_log( 'wcioWGCSSP: C1ST API token mangler. Kald blev ikke sendt.' );
+        return null;
     }
 
-    curl_setopt($curl, CURLOPT_HTTPHEADER, array(
-        'Accept: application/json',
-        'Content-Type: application/json',
-        'Authorization: Bearer ' . $this->token,
-    ));
+    $method = strtoupper( $method );
+    $url    = 'https://app.deltateq.com/api' . $endpoint;
 
-    curl_setopt($curl, CURLOPT_URL, $url);
-    curl_setopt($curl, CURLOPT_RETURNTRANSFER, 1);
-    $result = curl_exec($curl);
-    $status = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-    if ($status >= 300) {
-
-// Make an error for the shop owner
-
-        /*$this->logging("STATUS ERROR SERVICEPOS: <br>
-        'endpoint' => $url<br>
-        'status' => $status<br>
-        'error' => ''<br>
-        'method' => $method<br>
-        'result' => $result<br>
-        'token' => " . $this->token . "<br>", "");*/
-        exit; // just stop script, to avoid loops.
+    if ( 'GET' === $method && $data ) {
+        $url = add_query_arg( $data, $url );
     }
-    curl_close($curl);
 
-    sleep(1); // Delay execution for X seconds
+    $args = array(
+        'method'      => $method,
+        'timeout'     => 15,
+        'redirection' => 3,
+        'headers'     => array(
+            'Accept'        => 'application/json',
+            'Content-Type'  => 'application/json',
+            'Authorization' => 'Bearer ' . $this->token,
+        ),
+    );
 
-    return json_decode($result, true);
+    if ( in_array( $method, array( 'POST', 'PUT' ), true ) && false !== $data ) {
+        $args['body'] = wp_json_encode( $data );
+    }
+
+    $response = wp_remote_request( $url, $args );
+    if ( is_wp_error( $response ) ) {
+        error_log( sprintf( 'wcioWGCSSP: C1ST %s %s fejlede: %s', $method, $endpoint, $response->get_error_message() ) );
+        return null;
+    }
+
+    $status = (int) wp_remote_retrieve_response_code( $response );
+    $body   = wp_remote_retrieve_body( $response );
+
+    if ( $status < 200 || $status >= 300 ) {
+        error_log( sprintf( 'wcioWGCSSP: C1ST %s %s returnerede HTTP %d. Svar: %s', $method, $endpoint, $status, substr( $body, 0, 1000 ) ) );
+        return null;
+    }
+
+    $decoded = json_decode( $body, true );
+    if ( JSON_ERROR_NONE !== json_last_error() ) {
+        error_log( sprintf( 'wcioWGCSSP: C1ST %s %s returnerede ugyldig JSON.', $method, $endpoint ) );
+        return null;
+    }
+
+    return $decoded;
 }
 
 
@@ -228,6 +223,10 @@ function call($method, $endpoint, $data = false)
     public function wooGiftCardCreateUpdate($post_id, $post, $update)
     {
 
+        if ( $this->processing_inbound_webhook ) {
+            return;
+        }
+
         // Tjek om dette er en autosave eller en revision
         if (wp_is_post_autosave($post_id) || wp_is_post_revision($post_id)) {
             return;
@@ -246,7 +245,7 @@ function call($method, $endpoint, $data = false)
 
 
             // Check if value is empty
-            if (empty($amount_total) || empty($balance_total)) {
+            if ($amount_total === '' || $balance_total === '') {
                return; // No amount or balance
             }
             
@@ -283,21 +282,27 @@ function call($method, $endpoint, $data = false)
                                 [hasMore] => ) 
                 */ 
 
-                //Count if there is one
-                if(count($searchQuerydata["content"]) == 1) {
+                if ( null === $searchQuerydata ) {
+                    return;
+                }
+
+                // Count if there is exactly one.
+                if ( ! empty( $searchQuerydata['content'] ) && count( $searchQuerydata['content'] ) === 1 ) {
 
                     // Update giftcard in C1ST
                     $giftcardId = $searchQuerydata["content"][0]["id"];
                     // Nuværende amountspent i C1ST, bruges til at sikre at saldoen aldrig kan gå OP
                     $currentAmountSpent = isset($searchQuerydata["content"][0]["amountspent"]) ? $searchQuerydata["content"][0]["amountspent"] : null;
-                    $this->updateGiftCardC1ST($giftcardId, $amount_total, $balance_total, $currentAmountSpent);
+                    $this->updateGiftCardC1ST($giftcardId, $amount_total, $balance_total, $currentAmountSpent, $giftcardNo);
                     
 
-                } else {
+                } elseif ( empty( $searchQuerydata['content'] ) ) {
 
                     // If none found, then we need to create this giftcard instead.
                     $this->createGiftCardC1ST($giftcardNo, $amount_total, $balance_total, $expiration);
 
+                } else {
+                    error_log( sprintf( 'wcioWGCSSP: Flere C1ST-gavekort matcher koden %s. Ingen opdatering blev sendt.', $giftcardNo ) );
                 }
 
             } else {
@@ -364,15 +369,38 @@ function call($method, $endpoint, $data = false)
      * @param float|null $currentAmountSpent Den nuværende amountspent-værdi i C1ST, hvis kendt
      * @return bool true hvis opdateringen blev sendt, false hvis den blev blokeret
      */
-    public function updateGiftCardC1ST($giftcardId, $amount_total, $balance_total, $currentAmountSpent = null) {
+    public function updateGiftCardC1ST($giftcardId, $amount_total, $balance_total, $currentAmountSpent = null, $giftcardNo = '') {
 
         // Calculated amountspent.
-        $amountspent = $amount_total-$balance_total;
+        $amountspent = max( 0, (float) $amount_total - (float) $balance_total );
+
+        // Do not echo an inbound C1ST update straight back to C1ST.
+        if ( $currentAmountSpent !== null && abs( $amountspent - (float) $currentAmountSpent ) < 0.005 ) {
+            return true;
+        }
 
         // Sikkerhedstjek: bloker opdateringer der ville hæve saldoen (dvs. sænke amountspent)
-        if ($currentAmountSpent !== null && $amountspent < (float) $currentAmountSpent) {
+        $normalized_code = wc_format_coupon_code((string) $giftcardNo);
+        $increase        = $currentAmountSpent !== null ? (float) $currentAmountSpent - $amountspent : 0.0;
+        $allowed         = isset($this->allowed_balance_restores[$normalized_code])
+            ? (float) $this->allowed_balance_restores[$normalized_code]
+            : 0.0;
+
+        // A logged-in WooCommerce administrator may manually restore a balance
+        // up to the gift card's original amount. Frontend requests, cron jobs,
+        // webhooks and increases above the original value remain blocked.
+        $manual_admin_restore = is_admin()
+            && current_user_can('manage_woocommerce')
+            && !wp_doing_cron()
+            && (float) $balance_total <= (float) $amount_total + 0.01;
+
+        if ($currentAmountSpent !== null && $amountspent < (float) $currentAmountSpent && !$manual_admin_restore && ($allowed <= 0 || $increase > $allowed + 0.01)) {
             error_log("wcioWGCSSP: Blokerede forsøg på at hæve gavekort-saldo i C1ST (giftcard ID $giftcardId). Nyt amountspent ($amountspent) er lavere end nuværende amountspent i C1ST ($currentAmountSpent). Opdatering IKKE sendt.");
             return false;
+        }
+
+        if ($currentAmountSpent !== null && $amountspent < (float) $currentAmountSpent && $manual_admin_restore) {
+            error_log("wcioWGCSSP: Administrator genopfyldte gavekort $giftcardNo i C1ST med $increase.");
         }
 
         // Prepare array
@@ -380,9 +408,7 @@ function call($method, $endpoint, $data = false)
                 'amountspent' => (float)$amountspent
         ];
         
-        $this->call("PUT", "/giftcards/$giftcardId", ['content' => $giftcardData]);
-
-        return true;
+        return null !== $this->call("PUT", "/giftcards/$giftcardId", ['content' => $giftcardData]);
 
     }
 
@@ -398,7 +424,7 @@ function call($method, $endpoint, $data = false)
     public function createGiftCardC1ST($giftcardNo, $amount_total, $balance_total, $expiration = 0) {
 
         // Calculated amountspent.
-        $amountspent = $amount_total-$balance_total;
+        $amountspent = max(0, (float) $amount_total - (float) $balance_total);
 
         // Prepare array                
         $giftcard = [
@@ -418,7 +444,7 @@ function call($method, $endpoint, $data = false)
             $giftcard["expirationdate"] = $expirationDateString;
         }
 
-       $this->call("POST", "/giftcards",  ['content' => $giftcard]);
+       return null !== $this->call("POST", "/giftcards",  ['content' => $giftcard]);
 
     }
 
@@ -488,6 +514,52 @@ function call($method, $endpoint, $data = false)
         return $timestamp;
     }
 
+    /**
+     * Allow balance increases only while YITH restores a redeemed amount from
+     * an order that changes to cancelled, refunded or failed.
+     */
+    public function prepareGiftCardBalanceRestore($order_id, $from_status, $to_status, $order = false) {
+        $this->allowed_balance_restores = array();
+
+        if (!in_array($to_status, array('cancelled', 'refunded', 'failed'), true)) {
+            return;
+        }
+
+        $order = $order instanceof WC_Order ? $order : wc_get_order($order_id);
+        if (!$order) {
+            return;
+        }
+
+        foreach ($order->get_items('coupon') as $coupon_item) {
+            $code = wc_format_coupon_code($coupon_item->get_code());
+            if ($code === '') {
+                continue;
+            }
+
+            $amount = (float) $coupon_item->get_discount() + (float) $coupon_item->get_discount_tax();
+            if ($amount > 0) {
+                $this->allowed_balance_restores[$code] = ($this->allowed_balance_restores[$code] ?? 0.0) + $amount;
+            }
+        }
+
+        $applied_gift_cards = $order->get_meta('_ywgc_applied_gift_cards');
+        if (is_array($applied_gift_cards)) {
+            foreach ($applied_gift_cards as $code => $amount) {
+                $code = wc_format_coupon_code((string) $code);
+                if ($code !== '' && (float) $amount > 0) {
+                    $this->allowed_balance_restores[$code] = max(
+                        (float) ($this->allowed_balance_restores[$code] ?? 0.0),
+                        (float) $amount
+                    );
+                }
+            }
+        }
+    }
+
+    public function clearGiftCardBalanceRestore($order_id, $from_status, $to_status, $order = false) {
+        $this->allowed_balance_restores = array();
+    }
+
     //Run when giftcards are made from WooCommerce
     public function yith_ywgc_after_gift_card_generation_save($gift_card) {
          
@@ -511,7 +583,14 @@ function call($method, $endpoint, $data = false)
         // Udløbsdato (Unix timestamp fra YITH, 0 = ingen udløbsdato)
         $expiration = isset($gift_card->expiration) ? $gift_card->expiration : 0;
 
-        $this->createGiftCardC1ST($gift_card->gift_card_number, $gift_card->total_amount, $total_balance, $expiration);
+        $existing = $this->findGiftCardC1ST( $gift_card->gift_card_number );
+        if ( $existing && isset( $existing['id'] ) ) {
+            $current_amount_spent = isset( $existing['amountspent'] ) ? $existing['amountspent'] : null;
+            $this->updateGiftCardC1ST( $existing['id'], $gift_card->total_amount, $total_balance, $current_amount_spent, $gift_card->gift_card_number );
+            return;
+        }
+
+        $this->createGiftCardC1ST( $gift_card->gift_card_number, $gift_card->total_amount, $total_balance, $expiration );
     }
 
 /**
@@ -530,7 +609,9 @@ function call($method, $endpoint, $data = false)
 
     function wooGiftCardUpdate($meta_id, $post_id, $meta_key, $meta_value)
     {
-
+        if ( $this->processing_inbound_webhook ) {
+            return;
+        }
 
         // Tjek om meta nøglen er en af de vi er interesseret i
         if ($meta_key === '_ywgc_balance_total') {
@@ -544,7 +625,7 @@ function call($method, $endpoint, $data = false)
             if($giftcard && isset($giftcard["id"])) {
 
                 $currentAmountSpent = isset($giftcard["amountspent"]) ? $giftcard["amountspent"] : null;
-                $this->updateGiftCardC1ST($giftcard["id"], $amount_total, $balance_total, $currentAmountSpent);
+                $this->updateGiftCardC1ST($giftcard["id"], $amount_total, $balance_total, $currentAmountSpent, $giftcardNo);
 
             } else {
 
@@ -767,15 +848,148 @@ function call($method, $endpoint, $data = false)
  *
  * @link https://developer.wordpress.org/rest-api/extending-the-rest-api/adding-custom-endpoints/
  */
+    private function validateC1STWebhookRequest($request) {
+        if (empty($this->restsecret)) {
+            error_log('C1ST webhook rejected: REST hook secret is not configured.');
+            return new WP_Error('c1st_secret_missing', 'Webhook secret is not configured.', array('status' => 503));
+        }
+
+        $signature = (string) $request->get_header('X-C1st-Webhook-Signature');
+        $payload = (string) $request->get_body();
+        $calculated_hmac = base64_encode(hash_hmac('sha256', $payload, $this->restsecret, true));
+
+        if ($signature === '' || !hash_equals($calculated_hmac, $signature)) {
+            return new WP_Error('c1st_invalid_signature', 'Webhook failed signature check.', array('status' => 401));
+        }
+
+        $decoded = json_decode($payload);
+        if (!is_object($decoded) || !isset($decoded->content) || !is_object($decoded->content)) {
+            return new WP_Error('c1st_invalid_payload', 'Webhook payload is not valid JSON.', array('status' => 400));
+        }
+
+        return $decoded;
+    }
+
+    private function findWooGiftCardPostId($giftcardno) {
+        $query = new WP_Query(array(
+            'post_type'              => 'gift_card',
+            'post_status'            => 'any',
+            'title'                  => sanitize_text_field($giftcardno),
+            'posts_per_page'         => 1,
+            'fields'                 => 'ids',
+            'no_found_rows'          => true,
+            'update_post_meta_cache' => false,
+            'update_post_term_cache' => false,
+        ));
+
+        return !empty($query->posts) ? (int) $query->posts[0] : 0;
+    }
+
+    private function updateWooGiftCardFromC1ST($postID, $content, $created = false) {
+        $amount = isset($content->amount) ? max(0, (float) $content->amount) : 0;
+        $amountspent = isset($content->amountspent) ? max(0, (float) $content->amountspent) : 0;
+        $remaining = max(0, $amount - $amountspent);
+        $expired = !empty($content->expired);
+        $deleted = !empty($content->deleted) || !empty($content->deleted_at);
+        $expirationdate = isset($content->expirationdate) ? $content->expirationdate : '';
+
+        $this->processing_inbound_webhook = true;
+        try {
+            update_post_meta($postID, '_ywgc_amount_total', $amount);
+            update_post_meta($postID, '_ywgc_balance_total', $remaining);
+
+            $current_notes = (string) get_post_meta($postID, '_ywgc_internal_notes', true);
+            $action = $created ? 'created' : 'updated';
+            $note = date_i18n('d-m-Y H:i:s') . ": Gift card {$action} from C1ST; balance {$remaining}.";
+            update_post_meta($postID, '_ywgc_internal_notes', trim($current_notes . "\r\n" . $note));
+
+            $expirationTimestamp = $this->parseC1STExpirationDate($expirationdate);
+            if ($expirationTimestamp !== false) {
+                update_post_meta($postID, '_ywgc_expiration', $expirationTimestamp);
+                update_post_meta($postID, '_ywgc_expiration_date_formatted', date_i18n(apply_filters('yith_wcgc_date_format', 'Y-m-d'), $expirationTimestamp));
+            }
+
+            $target_status = ($deleted || $expired) ? 'ywgc-disabled' : 'publish';
+            if (get_post_status($postID) !== $target_status) {
+                wp_update_post(array('ID' => $postID, 'post_status' => $target_status));
+            }
+        } finally {
+            $this->processing_inbound_webhook = false;
+        }
+    }
+
+    public function secure_c1st_giftcard_created_api_endpoint($request) {
+        $payload = $this->validateC1STWebhookRequest($request);
+        if (is_wp_error($payload)) {
+            return $payload;
+        }
+
+        $content = $payload->content;
+        $giftcardno = isset($content->giftcardno) ? sanitize_text_field($content->giftcardno) : '';
+        if ($giftcardno === '' || !isset($content->amount)) {
+            return new WP_Error('c1st_missing_fields', 'Gift card number or amount is missing.', array('status' => 400));
+        }
+
+        $postID = $this->findWooGiftCardPostId($giftcardno);
+        if ($postID) {
+            $this->updateWooGiftCardFromC1ST($postID, $content, false);
+            return new WP_REST_Response(array('message' => 'Gift card already existed and was synchronized.', 'id' => $postID), 200);
+        }
+
+        $this->processing_inbound_webhook = true;
+        try {
+            $postID = wp_insert_post(array(
+                'post_title'   => $giftcardno,
+                'post_content' => '',
+                'post_status'  => (!empty($content->expired) || !empty($content->deleted) || !empty($content->deleted_at)) ? 'ywgc-disabled' : 'publish',
+                'post_author'  => get_current_user_id() ?: 1,
+                'post_type'    => 'gift_card',
+            ), true);
+        } finally {
+            $this->processing_inbound_webhook = false;
+        }
+
+        if (is_wp_error($postID)) {
+            error_log('C1ST gift card creation failed: ' . $postID->get_error_message());
+            return new WP_Error('c1st_create_failed', 'Gift card could not be created.', array('status' => 500));
+        }
+
+        $this->updateWooGiftCardFromC1ST((int) $postID, $content, true);
+        return new WP_REST_Response(array('message' => 'Gift card created.', 'id' => (int) $postID), 201);
+    }
+
+    public function secure_c1st_giftcard_updated_api_endpoint($request) {
+        $payload = $this->validateC1STWebhookRequest($request);
+        if (is_wp_error($payload)) {
+            return $payload;
+        }
+
+        $content = $payload->content;
+        $giftcardno = isset($content->giftcardno) ? sanitize_text_field($content->giftcardno) : '';
+        if ($giftcardno === '' || !isset($content->amount) || !isset($content->amountspent)) {
+            return new WP_Error('c1st_missing_fields', 'Gift card number, amount or amount spent is missing.', array('status' => 400));
+        }
+
+        $postID = $this->findWooGiftCardPostId($giftcardno);
+        if (!$postID) {
+            return new WP_Error('c1st_giftcard_not_found', 'Gift card not found in WooCommerce.', array('status' => 404));
+        }
+
+        $this->updateWooGiftCardFromC1ST($postID, $content, false);
+        return new WP_REST_Response(array('message' => 'Gift card updated.', 'id' => $postID), 200);
+    }
+
     function register_c1st_giftcard_api_endpoints()
     {
         register_rest_route('c1st/v1', '/giftcard.created', array(
             'methods' => 'POST',
-            'callback' => array($this, 'c1st_giftcard_created_api_endpoint'),
+            'callback' => array($this, 'secure_c1st_giftcard_created_api_endpoint'),
+            'permission_callback' => '__return_true',
         ));
         register_rest_route('c1st/v1', '/giftcard.updated', array(
             'methods' => 'POST',
-            'callback' => array($this, 'c1st_giftcard_updated_api_endpoint'),
+            'callback' => array($this, 'secure_c1st_giftcard_updated_api_endpoint'),
+            'permission_callback' => '__return_true',
         ));
     }
 
